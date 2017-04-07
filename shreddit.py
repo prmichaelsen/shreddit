@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+
 import os
 import sys
 import logging
@@ -15,6 +16,9 @@ from praw.errors import (InvalidUser, InvalidUserPass, RateLimitExceeded,
                         HTTPException, OAuthAppRequired)
 from praw.objects import Comment, Submission
 
+path = os.path.dirname(os.path.realpath(__file__))
+os.chdir(path);
+
 logging.basicConfig(stream=sys.stdout)
 log = logging.getLogger(__name__)
 log.setLevel(level=logging.DEBUG)
@@ -25,17 +29,51 @@ parser.add_argument(
     '--config',
     help="config file to use instead of the default shreddit.cfg"
 )
+parser.add_argument(
+    '-u',
+    '--user',
+    help="user to override user in config file"
+)
+parser.add_argument(
+    '-p',
+    '--password',
+    help="password to override password in config file"
+)
+parser.add_argument(
+    '-r',
+    '--refresh_token',
+    help="run with a token instead of password"
+)
+parser.add_argument(
+    '-j',
+    '--json',
+    help="run with a json string input instead of shreddit.yml"
+)
 args = parser.parse_args()
-
-if args.config:
-    config_file = args.config
+if args.json:
+  config = json.loads(args.json)
 else:
-    config_file = 'shreddit.yml'
+    if args.config:
+        config_file = args.config
+    else:
+        config_file = path+'/shreddit.yml'
 
-with open(config_file, 'r') as fh:
-    config = yaml.safe_load(fh)
-if config is None:
-    raise Exception("No config options passed!")
+    with open(config_file, 'r') as fh:
+        config = yaml.safe_load(fh)
+    if config is None:
+        raise Exception("No config options passed!")
+
+
+if args.user:
+    config['username'] = args.user
+
+if args.password:
+    config['password'] = args.password
+
+if args.refresh_token:
+    config['refresh_token'] = args.refresh_token
+elif 'refresh_token' not in config:
+    config['refresh_token'] = None
 
 save_directory = config.get('save_directory', '.')
 
@@ -43,13 +81,30 @@ r = praw.Reddit(user_agent="shreddit/4.3")
 if save_directory:
     r.config.store_json_result = True
 
+for k, v in config.iteritems():     
+    if type(v) is unicode:
+        if v == 'True':
+            config[k] = True
+        if v == 'False':
+            config[k] = False
+        if v.isdigit():
+            config[k] = int(v)
+        if v == '[]':
+            config[k] = []
+
+
 if config.get('verbose', True):
     log_level = config.get('debug', 'DEBUG')
     log.setLevel(level=getattr(logging, log_level))
 
+if not ('username' in config and 'password' in config) and config['refresh_token'] == None:
+    log.error("No login information provided. Exiting...");
+    exit();
+
 try:
     # Try to login with OAuth2
-    r.refresh_access_information()
+    log.debug("trying to login with oauth2");
+    r.refresh_access_information(config['refresh_token'])
     log.debug("Logged in with OAuth.")
 except (HTTPException, OAuthAppRequired) as e:
     log.warning('''You should migrate to OAuth2 using get_secret.py before
@@ -57,8 +112,10 @@ except (HTTPException, OAuthAppRequired) as e:
     try:
         try:
             r.login(config['username'], config['password'])
-        except InvalidUserPass:
-            r.login()  # Supply details on the command line
+        except InvalidUserPass as e:
+#            r.login()  # Supply details on the command line
+            log.info("Couldn't log in");
+            raise e
     except InvalidUser as e:
         raise InvalidUser("User does not exist.", e)
     except InvalidUserPass as e:
@@ -82,25 +139,6 @@ if whitelist:
 
 def get_sentence():
     return '''I have been Shreddited for privacy!'''
-try:
-    # Provide a method that works on windows
-    from loremipsum import get_sentence
-except ImportError:
-    # Module unavailable, use the default phrase
-    pass
-
-if config.get('replacement_format') == 'random':
-    wordlist = config.get('wordlist')
-    if not wordlist:
-        os_wordlist = '/usr/share/dict/words'
-        if os.name == 'posix' and os.path.isfile(os_wordlist):
-            # Generate a random string of words from our system's dictionary
-            with open(os_wordlist) as fh:
-                wordlist = fh.read().splitlines()
-    if wordlist:
-        def get_sentence():
-            return ' '.join(random.sample(wordlist, min(len(wordlist),
-                                                        random.randint(50,75))))
 
 
 def get_things(after=None):
@@ -120,14 +158,12 @@ def get_things(after=None):
 
 def remove_things(things):
     for thing in things:
-        log.debug('Starting remove function on: {thing}'.format(thing=thing))
+        log.debug('Looking at: {thing}'.format(thing=thing))
         # Seems to be in users's timezone. Unclear.
         thing_time = datetime.fromtimestamp(thing.created_utc)
         # Exclude items from being deleted unless past X hours.
         after_time = datetime.now() - timedelta(hours=config.get('hours', 24))
         if thing_time > after_time:
-            if thing_time + timedelta(hours=config.get('nuke_hours', 4320)) < datetime.utcnow():
-                pass
             continue
         # For edit_only we're assuming that the hours aren't altered.
         # This saves time when deleting (you don't edit already edited posts).
@@ -168,13 +204,8 @@ def remove_things(things):
                 url=thing.url.encode('utf-8'))
             )
         elif isinstance(thing, Comment):
-            rep_format = config.get('replacement_format')
-            if rep_format == 'random':
-                replacement_text = get_sentence()
-            elif rep_format == 'dot':
-                replacement_text = '.'
-            else:
-                replacement_text = rep_format
+            replacement_text = get_sentence()
+            log.debug('here');
 
             msg = '/r/{3}/ #{0} with:\n\t"{1}" to\n\t"{2}"'.format(
                 thing.id,
@@ -187,9 +218,9 @@ def remove_things(things):
                 log.info('Editing (not removing) {msg}'.format(msg=msg))
             else:
                 log.info('Editing and deleting {msg}'.format(msg=msg))
-
-            thing.edit(replacement_text)
+                thing.edit(replacement_text)
         if not config.get('edit_only'):
             thing.delete()
 
 remove_things(get_things())
+log.info("Done shredditing. Run again to shred more items.")
